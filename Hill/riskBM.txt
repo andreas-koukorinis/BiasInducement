@@ -1,0 +1,343 @@
+import numpy as np
+from typing import List, Dict, Tuple
+import pandas as pd
+
+class SingleFactorRiskBalancer:
+    def __init__(self,
+                 factor_limit: float = 50_000,   # CR01 units
+                 factor_target: float = 0,
+                 min_fill_rate: float = 10.0,
+                 max_fill_rate: float = 90.0,
+                 base_fill_rate: float = 50.0,
+                 smoothing_factor: float = 0.3,
+                 hedge_urgency: float = 2.0):
+        self.factor_limit = factor_limit
+        self.factor_target = factor_target
+        self.min_fill_rate = min_fill_rate
+        self.max_fill_rate = max_fill_rate
+        self.base_fill_rate = base_fill_rate
+        self.smoothing_factor = smoothing_factor
+        self.hedge_urgency = hedge_urgency
+
+    def calculate_portfolio_factor_exposure(self, positions: List[Dict]) -> float:
+        """Calculate CR01-weighted factor exposure: sum(CR01 × beta / 100)."""
+        total_exposure = sum(pos['cr01'] * (pos['factor_sensitivity'] / 100.0)
+                             for pos in positions)
+        return total_exposure
+
+    # def calculate_hedge_pressure(self, exposure: float) -> float:
+    #     imbalance = exposure - self.factor_target
+    #     return np.tanh(imbalance / self.factor_limit / self.smoothing_factor)
+
+    def calculate_hedge_pressure(self, exposure: float) -> float:
+        imbalance = exposure - self.factor_target
+        normalized = imbalance / self.factor_limit
+        steepness = 4 / self.smoothing_factor  # higher = steeper response
+    
+        # Sigmoid scaled to [-1, 1]
+        return 2 / (1 + np.exp(-steepness * normalized)) - 1
+
+    def calculate_target_fill_rates(
+        self,
+        positions: List[Dict],
+        bond_beta: float,
+        is_buy: bool
+    ) -> Dict:
+        exposure = self.calculate_portfolio_factor_exposure(positions)
+        pressure = self.calculate_hedge_pressure(exposure)
+        aggressiveness = abs(pressure) * self.hedge_urgency
+    
+        # Trade direction impact
+        trade_sign = 1 if is_buy else -1
+        exposure_delta = trade_sign * (bond_beta / 100)
+        aligned = (pressure * exposure_delta) < 0  # Only true if trade reduces risk
+    
+        if abs(pressure) < 0.1:
+            return {
+                'target_bid_fill_rate': self.base_fill_rate,
+                'target_offer_fill_rate': self.base_fill_rate,
+                'current_factor_exposure': exposure,
+                'hedge_pressure': pressure
+            }
+    
+        if pressure > 0:
+            bid, offer = self._skew_rates(aggressiveness, aligned)
+        else:
+            offer, bid = self._skew_rates(aggressiveness, aligned)
+    
+        return {
+            'target_bid_fill_rate': bid,
+            'target_offer_fill_rate': offer,
+            'current_factor_exposure': exposure,
+            'hedge_pressure': pressure
+        }
+
+
+
+
+    
+
+    def _neutral_rates(self, exposure: float, pressure: float) -> Dict:
+        return {
+            'target_bid_fill_rate': self.base_fill_rate,
+            'target_offer_fill_rate': self.base_fill_rate,
+            'current_factor_exposure': exposure,
+            'hedge_pressure': pressure
+        }
+
+    def _skew_rates(self, aggressiveness: float, aligned: bool) -> Tuple[float, float]:
+        if aligned:
+            bid = max(self.min_fill_rate,
+                      self.base_fill_rate - aggressiveness * (self.base_fill_rate - self.min_fill_rate))
+            offer = min(self.max_fill_rate,
+                        self.base_fill_rate + aggressiveness * (self.max_fill_rate - self.base_fill_rate))
+        else:
+            bid = min(self.max_fill_rate,
+                      self.base_fill_rate + aggressiveness * (self.max_fill_rate - self.base_fill_rate))
+            offer = max(self.min_fill_rate,
+                        self.base_fill_rate - aggressiveness * (self.base_fill_rate - self.min_fill_rate))
+        return bid, offer
+        
+    def create_bond_position(bond_id: str, cr01: float, factor_sensitivity: float) -> Dict:
+    	"""Create a bond with given CR01 exposure and factor beta (0–100 scale)."""
+	return {
+		'bond_id': bond_id,
+		'cr01': cr01,  # in $ per bp
+		'factor_sensitivity': factor_sensitivity  # 0–100 normalized
+	    }
+def logistic_fill_curve(skew: float, s50: float = 0.89, beta1: float = -5.0) -> float:
+    """Logistic curve mapping skew to fill probability."""
+    return 1 / (1 + np.exp(-beta1 * (skew - s50)))
+
+def invert_logistic_fill_curve(fill_prob: float, s50: float = 0.89, beta1: float = -5.0) -> float:
+    """Invert logistic function to compute skew for a target fill probability."""
+    if fill_prob <= 0 or fill_prob >= 1:
+        return s50
+    return s50 + np.log(fill_prob / (1 - fill_prob)) / beta1
+
+def convert_fill_rate_to_skew(fill_rate: float, s50: float = 0.89, beta1: float = -5.0) -> float:
+    """Convert a fill rate [0–100] to a skew value."""
+    return invert_logistic_fill_curve(fill_rate / 100.0, s50, beta1)
+    
+    
+def simulate_rfq_arrival(rfq_size_cr01: float,
+                         is_buy: bool,
+                         skew: float,
+                         s50: float = 0.89,
+                         beta1: float = -5.0) -> Tuple[bool, float]:
+    """Simulate RFQ fill event using logistic curve."""
+    effective_skew = skew if is_buy else -skew
+    fill_probability = logistic_fill_curve(effective_skew, s50, beta1)
+    is_filled = np.random.rand() < fill_probability
+    return is_filled, fill_probability
+
+def update_portfolio_position(portfolio: List[Dict], bond_id: str, delta_cr01: float) -> List[Dict]:
+    """Apply delta CR01 change to bond in portfolio."""
+    updated = portfolio.copy()
+    for bond in updated:
+        if bond['bond_id'] == bond_id:
+            bond['cr01'] += delta_cr01
+            break
+    return updated
+    
+    def run_single_rfq_simulation(
+    risk_balancer: SingleFactorRiskBalancer,
+    portfolio: List[Dict],
+    bond_id: str,
+    rfq_cr01: float,
+    bond_beta: float,
+    is_buy: bool,
+    s50: float = 0.89,
+    beta1: float = -5.0
+) -> Dict:
+    """
+    Simulate a single RFQ and return outcome including factor risk metrics.
+    CR01 and factor sensitivity drive everything. Idiosyncratic risk is ignored.
+    """
+    # Compute current exposure and hedge pressure
+    fill_rates = risk_balancer.calculate_target_fill_rates(portfolio, bond_beta, is_buy)
+    target_fill = fill_rates['target_offer_fill_rate'] if is_buy else fill_rates['target_bid_fill_rate']
+    optimal_skew = convert_fill_rate_to_skew(target_fill, s50, beta1)
+
+    # Simulate execution
+    is_filled, fill_prob = simulate_rfq_arrival(rfq_cr01, is_buy, optimal_skew, s50, beta1)
+
+    # Update CR01-based portfolio exposure
+    delta_cr01 = rfq_cr01 if is_filled and is_buy else -rfq_cr01 if is_filled else 0
+    updated_portfolio = update_portfolio_position(portfolio, bond_id, delta_cr01)
+
+    # Return full state before/after trade
+    return {
+        'is_filled': is_filled,
+        'fill_probability': fill_prob,
+        'optimal_skew': optimal_skew,
+        'target_fill_rate': target_fill,
+        'factor_exposure_before': fill_rates['current_factor_exposure'],
+        'factor_exposure_after': risk_balancer.calculate_portfolio_factor_exposure(updated_portfolio),
+        'hedge_pressure': fill_rates['hedge_pressure'],
+        'updated_portfolio': updated_portfolio
+    }
+    
+    import pandas as pd
+from typing import List, Dict
+
+def run_multi_rfq_simulation(risk_balancer: SingleFactorRiskBalancer,
+                             initial_portfolio: List[Dict],
+                             rfq_sequence: List[Dict],
+                             s50: float = 0.89,
+                             beta1: float = -5.0) -> pd.DataFrame:
+    """Simulate a sequence of RFQs and track portfolio evolution."""
+    results = []
+    portfolio = initial_portfolio.copy()
+
+    for i, rfq in enumerate(rfq_sequence):
+        result = run_single_rfq_simulation(
+            risk_balancer,
+            portfolio,
+            rfq['bond_id'],
+            rfq['cr01'],
+            rfq['factor_sensitivity'],
+            rfq['is_buy'],
+            s50,
+            beta1
+        )
+        result_row = {
+            'rfq_id': i,
+            'bond_id': rfq['bond_id'],
+            'rfq_size_cr01': rfq['cr01'],
+            'is_buy_rfq': rfq['is_buy'],
+            'factor_sensitivity': rfq['factor_sensitivity'],
+            'is_filled': result['is_filled'],
+            'fill_probability': result['fill_probability'],
+            'optimal_skew': result['optimal_skew'],
+            'target_fill_rate': result['target_fill_rate'],
+            'factor_exposure_before': result['factor_exposure_before'],
+            'factor_exposure_after': result['factor_exposure_after'],
+            'hedge_pressure': result['hedge_pressure']
+        }
+        results.append(result_row)
+        portfolio = result['updated_portfolio']
+
+    return pd.DataFrame(results)
+    
+ def calculate_simulation_metrics(results: pd.DataFrame) -> Dict:
+    return {
+        'total_rfqs': len(results),
+        'fill_rate': results['is_filled'].mean(),
+        'final_exposure': results['factor_exposure_after'].iloc[-1],
+        'exposure_volatility': results['factor_exposure_after'].std(),
+        'max_exposure': results['factor_exposure_after'].max(),
+        'min_exposure': results['factor_exposure_after'].min(),
+        'avg_fill_probability': results['fill_probability'].mean(),
+        'avg_hedge_pressure': results['hedge_pressure'].mean()
+    }
+def visualize_risk_balancer_behavior(results: pd.DataFrame, exposure_limit: float):
+    fig, axs = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+
+    # Exposure over time
+    axs[0].plot(results['rfq_id'], results['factor_exposure_after'], label='Exposure', linewidth=2)
+    axs[0].axhline(exposure_limit, color='red', linestyle='--', label='+Limit')
+    axs[0].axhline(-exposure_limit, color='red', linestyle='--', label='-Limit')
+    axs[0].axhline(0, color='gray', linestyle=':')
+    axs[0].set_ylabel("CR01 Exposure ($)")
+    axs[0].set_title("Portfolio Factor Exposure Over Time")
+    axs[0].legend()
+    axs[0].grid(True)
+
+    # Hedge pressure signal
+    axs[1].plot(results['rfq_id'], results['hedge_pressure'], color='purple', linewidth=2)
+    axs[1].axhline(0, color='gray', linestyle=':')
+    axs[1].set_ylabel("Hedge Pressure")
+    axs[1].set_title("Hedge Pressure Signal (tanh scaled)")
+    axs[1].grid(True)
+
+    # Fill rates
+    axs[2].plot(results['rfq_id'], results['target_fill_rate'], color='green', linewidth=2)
+    axs[2].set_ylabel("Target Fill Rate (%)")
+    axs[2].set_xlabel("RFQ Sequence")
+    axs[2].set_title("Dynamic Fill Rate Response")
+    axs[2].grid(True)
+
+    plt.tight_layout()
+    plt.show()   
+    
+   def generate_random_rfq_sequence(n: int,
+                                 universe: List[Dict],
+                                 cr01_range: Tuple[float, float] = (500, 5000),
+                                 buy_prob: float = 0.5) -> List[Dict]:
+    rfqs = []
+    for _ in range(n):
+        bond = np.random.choice(universe)
+        size = np.random.uniform(*cr01_range)
+        is_buy = np.random.rand() < buy_prob
+        rfqs.append({
+            'bond_id': bond['bond_id'],
+            'cr01': size,
+            'factor_sensitivity': bond['factor_sensitivity'],
+            'is_buy': is_buy
+        })
+    return rfqs
+    
+def run_cr01_pipeline_simulation():
+    import numpy as np
+    import pandas as pd
+
+    # Define initial portfolio in CR01 units
+    initial_portfolio = [
+        create_bond_position('IG_5Y', 12000, 40),  # $12K CR01, 40 beta
+        create_bond_position('HY_3Y', 8000, 25),   # $8K CR01, 25 beta
+        create_bond_position('IG_2Y', -5000, 20)   # -$5K CR01, 20 beta
+    ]
+
+    # Create a bond universe with normalized betas (0–100)
+    bond_universe = [
+        {'bond_id': 'IG_2Y', 'factor_sensitivity': 20},
+        {'bond_id': 'IG_5Y', 'factor_sensitivity': 40},
+        {'bond_id': 'IG_10Y', 'factor_sensitivity': 70},
+        {'bond_id': 'HY_3Y', 'factor_sensitivity': 25},
+        {'bond_id': 'HY_7Y', 'factor_sensitivity': 55}
+    ]
+
+    # Initialize the risk balancer
+    rb = SingleFactorRiskBalancer(
+        factor_limit=10_000,   # Limit in CR01
+        factor_target=-1000,       # Target exposure
+        hedge_urgency=3.0
+    )
+
+    # 4️ Generate RFQs
+    np.random.seed(42)  # reproducibility
+    rfqs = generate_random_rfq_sequence(
+        n=500,
+        universe=bond_universe,
+        cr01_range=(-1500, 2500),
+        buy_prob=0.5
+    )
+
+    # Run the full simulation
+    results_df = run_multi_rfq_simulation(rb, initial_portfolio, rfqs)
+
+    # Calculate metrics
+    metrics = calculate_simulation_metrics(results_df)
+
+    # Print summary metrics
+    print(" SIMULATION METRICS")
+    print("=" * 30)
+    for key, value in metrics.items():
+        print(f"{key}: {value:,.2f}")
+
+    # Visualize risk balancer dynamics
+    visualize_risk_balancer_behavior(results_df, rb.factor_limit)
+
+    return results_df, metrics
+
+
+
+
+
+
+
+
+	   
+ 
+
